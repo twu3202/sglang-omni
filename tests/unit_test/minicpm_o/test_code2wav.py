@@ -29,6 +29,8 @@ from sglang_omni.models.minicpm_o.components.code2wav import (
     SAMPLES_PER_CODEC_TOKEN,
     MiniCPMOCode2Wav,
 )
+from sglang_omni.models.minicpm_o.components.token2wav import vocoder
+from sglang_omni.models.minicpm_o.components.token2wav.hift_layers import SineGen2
 from sglang_omni.models.minicpm_o.components.token2wav.vocoder import SpeakerPrompt
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
 from sglang_omni.models.minicpm_o.payload_types import MiniCPMOPipelineState
@@ -168,6 +170,8 @@ def build_code2wav_model(
             enable_flow_variable_length=enable_flow_variable_length,
             reference_workers=reference_workers,
             prompt_cache_capacity=prompt_cache_capacity,
+            decode_stream_priority=code2wav_stage_factory().decode_stream_priority,
+            enable_flow_block_compile=code2wav_stage_factory().enable_flow_block_compile,
         )
         built_models.append(model)
         return model
@@ -253,6 +257,8 @@ def build_code2wav_stage(
         enable_flow_variable_length=factory.enable_flow_variable_length,
         reference_workers=factory.reference_workers,
         prompt_cache_capacity=factory.prompt_cache_capacity,
+        decode_stream_priority=factory.decode_stream_priority,
+        enable_flow_block_compile=factory.enable_flow_block_compile,
     )
 
 
@@ -266,6 +272,8 @@ def load_checkpoint_model(
         enable_flow_variable_length=enable_flow_variable_length,
         reference_workers=factory.reference_workers,
         prompt_cache_capacity=factory.prompt_cache_capacity,
+        decode_stream_priority=factory.decode_stream_priority,
+        enable_flow_block_compile=factory.enable_flow_block_compile,
     )
 
 
@@ -275,10 +283,29 @@ def relative_rms_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     )
 
 
+def test_vocoder_noise_uses_an_independent_generator() -> None:
+    sine_generator = SineGen2(samp_rate=24000, upsample_scale=4)
+    frequencies = torch.full((2, 400, 1), 120.0)
+    generator = torch.Generator().manual_seed(7)
+    random_state = torch.get_rng_state()
+    first = sine_generator(frequencies, generator)
+    second = sine_generator(frequencies, torch.Generator().manual_seed(7))
+    third = sine_generator(frequencies, generator)
+    assert torch.equal(random_state, torch.get_rng_state())
+    for actual, expected in zip(first, second, strict=True):
+        torch.testing.assert_close(actual, expected)
+    assert not torch.equal(first[0], third[0])
+
+
 @pytest.mark.accelerator
 def test_native_vocoder_with_checkpoint() -> None:
     model = load_checkpoint_model(require_checkpoint_dir())
+    device_module = torch.get_device_module(model.token2wav.device)
+    random_state = device_module.get_rng_state(model.token2wav.device)
     output = model(codec_tokens=torch.tensor(CHECKPOINT_CODEC_TOKENS))
+    assert torch.equal(
+        random_state, device_module.get_rng_state(model.token2wav.device)
+    )
     waveform = output["waveform"]
     assert output["sample_rate"] == 24000
     assert waveform.dtype == np.float32
@@ -336,8 +363,13 @@ def test_mixed_reference_batch_matches_single_row_mels(
         return generated_mel
 
     monkeypatch.setattr(model.token2wav.flow, "inference", record_generated_mel)
+    device_module = torch.get_device_module(model.token2wav.device)
+    random_state = device_module.get_rng_state(model.token2wav.device)
     try:
         model.vocode(sequences, references)
+        assert torch.equal(
+            random_state, device_module.get_rng_state(model.token2wav.device)
+        )
         batched_mels = generated_mels.pop()
         for row, (tokens, reference) in enumerate(
             zip(sequences, references, strict=True)
@@ -406,15 +438,23 @@ def test_variable_length_option_reaches_dit(
     assert estimator.enable_variable_length is enable_flow_variable_length
 
 
-def test_speech_pipeline_enables_code2wav_batching_by_default() -> None:
-    factory = code2wav_stage_factory()
-    assert factory.max_batch_size == 8
-    assert factory.max_batch_wait_ms == 0.0
+def test_speech_pipeline_colocates_batched_code2wav_with_talker_by_default() -> None:
+    config = MiniCPMOSpeechPipelineConfig(model_path="unused")
+    stages_by_name = {stage.name: stage for stage in config.stages}
+    code2wav = stages_by_name["code2wav"]
+    talker = stages_by_name["talker"]
+    assert code2wav.process == talker.process
+    assert code2wav.gpu == talker.gpu
+    factory = code2wav.factory
+    assert factory.max_batch_size == 16
+    assert factory.max_batch_wait_ms == 100.0
     assert factory.batch_wait_when_idle is False
     assert factory.dtype is None
     assert factory.enable_flow_variable_length is True
     assert factory.reference_workers == 8
     assert factory.prompt_cache_capacity == 32
+    assert factory.decode_stream_priority == -1
+    assert factory.enable_flow_block_compile is True
 
 
 @pytest.mark.parametrize(
@@ -438,6 +478,54 @@ def test_vocode_runs_mixed_references_in_one_flow_call(
 ) -> None:
     build_code2wav_model().vocode([[1, 2], [3], [4, 5, 6]], [b"a", b"spk-b", b"c"])
     assert fake_token2wav.flow.inference.call_count == 1
+
+
+def test_vocode_decodes_on_its_own_stream(
+    build_code2wav_model: Code2WavBuilder, fake_token2wav: MagicMock
+) -> None:
+    """Reference preparation and decoding leave the caller's stream unchanged."""
+    decode_streams: list[torch.Stream] = []
+    reference_streams: list[torch.Stream] = []
+
+    def prepare_prompt(source: str | io.BytesIO) -> vocoder.SpeakerPrompt:
+        reference_streams.append(torch.cpu.current_stream())
+        return fake_prepare_prompt(source)
+
+    def decode_flow(
+        speech_tokens: torch.Tensor,
+        speech_token_lengths: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+        prompt_token_lengths: torch.Tensor,
+        prompt_mels: torch.Tensor,
+        speaker_embeddings: torch.Tensor,
+        n_timesteps: int,
+    ) -> torch.Tensor:
+        decode_streams.append(torch.cpu.current_stream())
+        return fake_flow_inference(
+            speech_tokens,
+            speech_token_lengths,
+            prompt_tokens,
+            prompt_token_lengths,
+            prompt_mels,
+            speaker_embeddings,
+            n_timesteps,
+        )
+
+    def decode_hift(speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
+        decode_streams.append(torch.cpu.current_stream())
+        return fake_hift(speech_feat)
+
+    fake_token2wav.flow.inference.side_effect = decode_flow
+    fake_token2wav.hift.side_effect = decode_hift
+    fake_token2wav.prepare_prompt.side_effect = prepare_prompt
+    model = build_code2wav_model(reference_workers=1)
+    caller_stream = torch.cpu.current_stream()
+    waveforms = model.vocode([[1, 2], [3]], [b"a", b"b"])
+    assert reference_streams == [model.decode_stream] * 2
+    assert decode_streams == [model.decode_stream] * 3
+    assert torch.cpu.current_stream() == caller_stream
+    np.testing.assert_array_equal(waveforms[0], expected_waveform([1, 2], b"a"))
+    np.testing.assert_array_equal(waveforms[1], expected_waveform([3], b"b"))
 
 
 def test_vocode_mixed_lengths_preserve_hift_boundaries(

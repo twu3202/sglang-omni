@@ -196,7 +196,12 @@ def test_gpu_stage_factories_forward_gpu_id_into_device_spec_resolution(
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     arm_device_spec_resolvers(monkeypatch, factory_path=stage.factory_path)
-    kwargs: dict[str, object] = {"device": None, "gpu_id": 2}
+    kwargs = {
+        name: value
+        for name, value in stage.factory.model_dump(exclude_unset=True).items()
+        if name in inspect.signature(factory).parameters
+    }
+    kwargs.update(device=None, gpu_id=2)
     if "model_path" in factory_parameters(stage.factory_path):
         kwargs["model_path"] = "unused"
     try:
