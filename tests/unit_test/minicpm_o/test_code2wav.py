@@ -30,7 +30,9 @@ from sglang_omni.models.minicpm_o.components.code2wav import (
     MiniCPMOCode2Wav,
 )
 from sglang_omni.models.minicpm_o.components.token2wav import vocoder
-from sglang_omni.models.minicpm_o.components.token2wav.hift_layers import SineGen2
+from sglang_omni.models.minicpm_o.components.token2wav.hift_layers import (
+    SourceModuleHnNSF2,
+)
 from sglang_omni.models.minicpm_o.components.token2wav.vocoder import SpeakerPrompt
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
 from sglang_omni.models.minicpm_o.payload_types import MiniCPMOPipelineState
@@ -57,6 +59,12 @@ CONDITIONING_TENSOR_COUNT = 3
 DEFAULT_REFERENCE_AUDIO = b"default"
 THREAD_WAIT_SECONDS = 5
 BLOCKED_CALL_PROBE_SECONDS = 0.1
+SOURCE_MODULE_SAMPLE_RATE = 24000
+SOURCE_MODULE_UPSAMPLE_SCALE = 4
+SOURCE_MODULE_FREQUENCY_HERTZ = 120.0
+SOURCE_MODULE_FRAME_COUNT = 400
+SOURCE_MODULE_BATCH_SIZE = 2
+SOURCE_MODULE_NOISE_SEED = 7
 
 
 class Code2WavBuilder(Protocol):
@@ -283,24 +291,42 @@ def relative_rms_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     )
 
 
-def test_vocoder_noise_uses_an_independent_generator() -> None:
-    sine_generator = SineGen2(samp_rate=24000, upsample_scale=4)
-    frequencies = torch.full((2, 400, 1), 120.0)
-    generator = torch.Generator().manual_seed(7)
-    random_state = torch.get_rng_state()
-    first = sine_generator(frequencies, generator)
-    second = sine_generator(frequencies, torch.Generator().manual_seed(7))
-    third = sine_generator(frequencies, generator)
-    assert torch.equal(random_state, torch.get_rng_state())
-    for actual, expected in zip(first, second, strict=True):
-        torch.testing.assert_close(actual, expected)
-    assert not torch.equal(first[0], third[0])
+def test_source_module_noise_leaves_the_global_generator_unchanged() -> None:
+    """HiFT's source module draws both sine noise and residual noise."""
+    source_module = SourceModuleHnNSF2(
+        sampling_rate=SOURCE_MODULE_SAMPLE_RATE,
+        upsample_scale=SOURCE_MODULE_UPSAMPLE_SCALE,
+    )
+    fundamental_frequency = torch.full(
+        (SOURCE_MODULE_BATCH_SIZE, SOURCE_MODULE_FRAME_COUNT, 1),
+        SOURCE_MODULE_FREQUENCY_HERTZ,
+    )
+    noise_generator = torch.Generator().manual_seed(SOURCE_MODULE_NOISE_SEED)
+    global_generator_state = torch.get_rng_state()
+    seeded_source = source_module(fundamental_frequency, noise_generator)
+    repeated_seeded_source = source_module(
+        fundamental_frequency,
+        torch.Generator().manual_seed(SOURCE_MODULE_NOISE_SEED),
+    )
+    continued_source = source_module(fundamental_frequency, noise_generator)
+    seeded_sine, _, _ = seeded_source
+    continued_sine, _, _ = continued_source
+    assert torch.equal(global_generator_state, torch.get_rng_state())
+    for seeded_tensor, repeated_tensor in zip(
+        seeded_source, repeated_seeded_source, strict=True
+    ):
+        torch.testing.assert_close(seeded_tensor, repeated_tensor)
+    assert not torch.equal(seeded_sine, continued_sine)
 
 
 @pytest.mark.accelerator
 def test_native_vocoder_with_checkpoint() -> None:
     model = load_checkpoint_model(require_checkpoint_dir())
     device_module = torch.get_device_module(model.token2wav.device)
+    assert model.decode_stream != device_module.current_stream(model.token2wav.device)
+    assert (
+        model.decode_stream.priority == code2wav_stage_factory().decode_stream_priority
+    )
     random_state = device_module.get_rng_state(model.token2wav.device)
     output = model(codec_tokens=torch.tensor(CHECKPOINT_CODEC_TOKENS))
     assert torch.equal(
@@ -479,7 +505,8 @@ def test_vocode_prepares_and_decodes_on_its_private_stream(
     build_code2wav_model: Code2WavBuilder, fake_token2wav: MagicMock
 ) -> None:
     """Reference preparation and decoding leave the caller's stream unchanged."""
-    flow_and_hift_streams: list[torch.Stream] = []
+    flow_streams: list[torch.Stream] = []
+    hift_streams: list[torch.Stream] = []
     reference_preparation_streams: list[torch.Stream] = []
 
     def prepare_prompt(source: str | io.BytesIO) -> vocoder.SpeakerPrompt:
@@ -495,7 +522,7 @@ def test_vocode_prepares_and_decodes_on_its_private_stream(
         speaker_embeddings: torch.Tensor,
         n_timesteps: int,
     ) -> torch.Tensor:
-        flow_and_hift_streams.append(torch.cpu.current_stream())
+        flow_streams.append(torch.cpu.current_stream())
         return fake_flow_inference(
             speech_tokens,
             speech_token_lengths,
@@ -507,19 +534,23 @@ def test_vocode_prepares_and_decodes_on_its_private_stream(
         )
 
     def decode_hift(speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
-        flow_and_hift_streams.append(torch.cpu.current_stream())
+        hift_streams.append(torch.cpu.current_stream())
         return fake_hift(speech_feat)
 
     fake_token2wav.flow.inference.side_effect = decode_flow
     fake_token2wav.hift.side_effect = decode_hift
     fake_token2wav.prepare_prompt.side_effect = prepare_prompt
     references = [b"a", b"b"]
+    # note (zhaochenyang20): CPU current-stream state is process-global, so one worker.
     model = build_code2wav_model(reference_workers=1)
     caller_stream = torch.cpu.current_stream()
     model.vocode([[1, 2], [3]], references)
     assert reference_preparation_streams == [model.decode_stream] * len(references)
-    assert flow_and_hift_streams
-    assert all(stream == model.decode_stream for stream in flow_and_hift_streams)
+    assert flow_streams
+    assert hift_streams
+    assert all(stream == model.decode_stream for stream in flow_streams)
+    assert all(stream == model.decode_stream for stream in hift_streams)
+    assert model.decode_stream != caller_stream
     assert torch.cpu.current_stream() == caller_stream
 
 
