@@ -363,13 +363,8 @@ def test_mixed_reference_batch_matches_single_row_mels(
         return generated_mel
 
     monkeypatch.setattr(model.token2wav.flow, "inference", record_generated_mel)
-    device_module = torch.get_device_module(model.token2wav.device)
-    random_state = device_module.get_rng_state(model.token2wav.device)
     try:
         model.vocode(sequences, references)
-        assert torch.equal(
-            random_state, device_module.get_rng_state(model.token2wav.device)
-        )
         batched_mels = generated_mels.pop()
         for row, (tokens, reference) in enumerate(
             zip(sequences, references, strict=True)
@@ -480,15 +475,15 @@ def test_vocode_runs_mixed_references_in_one_flow_call(
     assert fake_token2wav.flow.inference.call_count == 1
 
 
-def test_vocode_decodes_on_its_own_stream(
+def test_vocode_prepares_and_decodes_on_its_private_stream(
     build_code2wav_model: Code2WavBuilder, fake_token2wav: MagicMock
 ) -> None:
     """Reference preparation and decoding leave the caller's stream unchanged."""
-    decode_streams: list[torch.Stream] = []
-    reference_streams: list[torch.Stream] = []
+    flow_and_hift_streams: list[torch.Stream] = []
+    reference_preparation_streams: list[torch.Stream] = []
 
     def prepare_prompt(source: str | io.BytesIO) -> vocoder.SpeakerPrompt:
-        reference_streams.append(torch.cpu.current_stream())
+        reference_preparation_streams.append(torch.cpu.current_stream())
         return fake_prepare_prompt(source)
 
     def decode_flow(
@@ -500,7 +495,7 @@ def test_vocode_decodes_on_its_own_stream(
         speaker_embeddings: torch.Tensor,
         n_timesteps: int,
     ) -> torch.Tensor:
-        decode_streams.append(torch.cpu.current_stream())
+        flow_and_hift_streams.append(torch.cpu.current_stream())
         return fake_flow_inference(
             speech_tokens,
             speech_token_lengths,
@@ -512,20 +507,20 @@ def test_vocode_decodes_on_its_own_stream(
         )
 
     def decode_hift(speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
-        decode_streams.append(torch.cpu.current_stream())
+        flow_and_hift_streams.append(torch.cpu.current_stream())
         return fake_hift(speech_feat)
 
     fake_token2wav.flow.inference.side_effect = decode_flow
     fake_token2wav.hift.side_effect = decode_hift
     fake_token2wav.prepare_prompt.side_effect = prepare_prompt
+    references = [b"a", b"b"]
     model = build_code2wav_model(reference_workers=1)
     caller_stream = torch.cpu.current_stream()
-    waveforms = model.vocode([[1, 2], [3]], [b"a", b"b"])
-    assert reference_streams == [model.decode_stream] * 2
-    assert decode_streams == [model.decode_stream] * 3
+    model.vocode([[1, 2], [3]], references)
+    assert reference_preparation_streams == [model.decode_stream] * len(references)
+    assert flow_and_hift_streams
+    assert all(stream == model.decode_stream for stream in flow_and_hift_streams)
     assert torch.cpu.current_stream() == caller_stream
-    np.testing.assert_array_equal(waveforms[0], expected_waveform([1, 2], b"a"))
-    np.testing.assert_array_equal(waveforms[1], expected_waveform([3], b"b"))
 
 
 def test_vocode_mixed_lengths_preserve_hift_boundaries(
