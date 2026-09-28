@@ -134,14 +134,14 @@ class SineGen2(torch.nn.Module):
         return uv
 
     def f02sine(
-        self, f0_values: torch.Tensor, generator: torch.Generator
+        self, f0_values: torch.Tensor, noise_generator: torch.Generator
     ) -> torch.Tensor:
         rad_values = f0_values / self.sampling_rate % 1
         rand_ini = torch.rand(
             f0_values.shape[0],
             f0_values.shape[2],
             device=f0_values.device,
-            generator=generator,
+            generator=noise_generator,
         )
         rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
@@ -159,15 +159,17 @@ class SineGen2(torch.nn.Module):
         return torch.sin(phase)
 
     def forward(
-        self, f0: torch.Tensor, generator: torch.Generator
+        self, f0: torch.Tensor, noise_generator: torch.Generator
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fn = torch.multiply(
             f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device)
         )
-        sine_waves = self.f02sine(fn, generator) * self.sine_amp
+        sine_waves = self.f02sine(fn, noise_generator) * self.sine_amp
         uv = self.f02uv(f0)
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        noise = noise_amp * torch.empty_like(sine_waves).normal_(generator=generator)
+        noise = noise_amp * torch.empty_like(sine_waves).normal_(
+            generator=noise_generator
+        )
         sine_waves = sine_waves * uv + noise
         return (sine_waves, uv, noise)
 
@@ -198,10 +200,12 @@ class SourceModuleHnNSF2(torch.nn.Module):
         self.l_tanh = torch.nn.Tanh()
 
     def forward(
-        self, x: torch.Tensor, generator: torch.Generator
+        self, x: torch.Tensor, noise_generator: torch.Generator
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x, generator)
+            sine_wavs, uv, _ = self.l_sin_gen(x, noise_generator)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
-        noise = torch.empty_like(uv).normal_(generator=generator) * self.sine_amp / 3
+        noise = (
+            torch.empty_like(uv).normal_(generator=noise_generator) * self.sine_amp / 3
+        )
         return (sine_merge, noise, uv)

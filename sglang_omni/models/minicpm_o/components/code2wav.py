@@ -94,9 +94,9 @@ class MiniCPMOCode2Wav(nn.Module):
             enable_flow_variable_length
         )
         if enable_flow_block_compile and self.token2wav.device.type == "cuda":
-            for block in self.token2wav.flow.decoder.estimator.blocks:
-                block.forward_packed = torch.compile(
-                    block.forward_packed,
+            for flow_block in self.token2wav.flow.decoder.estimator.blocks:
+                flow_block.forward_packed = torch.compile(
+                    flow_block.forward_packed,
                     dynamic=True,
                     fullgraph=True,
                     options={"emulate_precision_casts": True},
@@ -108,6 +108,7 @@ class MiniCPMOCode2Wav(nn.Module):
             self.decode_stream: torch.Stream = device_module.Stream(
                 priority=decode_stream_priority,
             )
+            # note (zhaochenyang20): weights are published on the load stream.
             self.decode_stream.wait_stream(device_module.current_stream())
 
         if prompt_wav is None:
@@ -309,6 +310,7 @@ class MiniCPMOCode2Wav(nn.Module):
         token_sequences: Sequence[Sequence[int]],
         prompts: Sequence[SpeakerPrompt],
     ) -> list[np.ndarray]:
+        """Run flow and HiFT. The caller selects the decode stream."""
         device = self.token2wav.device
         token_lengths = [len(tokens) for tokens in token_sequences]
         speech_tokens = pad_sequence(
