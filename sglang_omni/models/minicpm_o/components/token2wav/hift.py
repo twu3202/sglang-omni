@@ -246,9 +246,9 @@ class HiFTGenerator(nn.Module):
             self.noise_generator = noise_generator
         else:
             noise_generator = self.noise_generator
-        f0 = self.f0_predictor(speech_feat)
-        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)
-        s, _, _ = self.m_source(s, noise_generator)
-        s = s.transpose(1, 2)
-        generated_speech = self.decode(x=speech_feat, s=s)
-        return (generated_speech, s)
+        fundamental_frequency = self.f0_predictor(speech_feat)
+        source_signal = self.f0_upsamp(fundamental_frequency[:, None]).transpose(1, 2)
+        source_signal, _, _ = self.m_source(source_signal, noise_generator)
+        source_signal = source_signal.transpose(1, 2)
+        generated_speech = self.decode(x=speech_feat, s=source_signal)
+        return (generated_speech, source_signal)
