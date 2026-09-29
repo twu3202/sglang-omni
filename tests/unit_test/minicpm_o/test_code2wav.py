@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -64,6 +64,12 @@ SOURCE_MODULE_FREQUENCY_HERTZ = 120.0
 SOURCE_MODULE_FRAME_COUNT = 400
 SOURCE_MODULE_BATCH_SIZE = 2
 SOURCE_MODULE_NOISE_SEED = 7
+MILLISECONDS_PER_SECOND = 1000
+PACKED_FLOW_COMPILE: dict[str, bool | dict[str, bool]] = {
+    "dynamic": True,
+    "fullgraph": True,
+    "options": {"emulate_precision_casts": True},
+}
 
 
 class Code2WavBuilder(Protocol):
@@ -73,6 +79,7 @@ class Code2WavBuilder(Protocol):
         reference_workers: int = ...,
         prompt_cache_capacity: int = ...,
         enable_flow_variable_length: bool = ...,
+        enable_flow_block_compile: bool | None = ...,
     ) -> MiniCPMOCode2Wav: ...
 
 
@@ -118,6 +125,27 @@ def fake_flow_inference(
     return frames.unsqueeze(1).expand(-1, FAKE_MEL_BINS, -1)
 
 
+def capture_flow_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict[str, bool | dict[str, bool]]]:
+    compiled_options: list[dict[str, bool | dict[str, bool]]] = []
+
+    def record_compile(
+        forward_packed: MagicMock,
+        *,
+        dynamic: bool,
+        fullgraph: bool,
+        options: dict[str, bool],
+    ) -> MagicMock:
+        compiled_options.append(
+            {"dynamic": dynamic, "fullgraph": fullgraph, "options": options}
+        )
+        return forward_packed
+
+    monkeypatch.setattr(torch, "compile", record_compile)
+    return compiled_options
+
+
 def fake_hift(speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
     samples_per_frame = SAMPLES_PER_CODEC_TOKEN // FAKE_UP_RATE
     waveform = speech_feat[:, :1].repeat_interleave(samples_per_frame, dim=-1)
@@ -153,6 +181,7 @@ def fake_token2wav(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MagicMock
     token2wav.hift.side_effect = fake_hift
     token2wav.prepare_prompt.side_effect = fake_prepare_prompt
     monkeypatch.setattr(code2wav, "Token2Wav", MagicMock(return_value=token2wav))
+    token2wav.original_cuda_device = torch.cuda.device
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     return token2wav
 
@@ -170,7 +199,14 @@ def build_code2wav_model(
         reference_workers: int = 8,
         prompt_cache_capacity: int = 32,
         enable_flow_variable_length: bool = False,
+        enable_flow_block_compile: bool | None = None,
     ) -> MiniCPMOCode2Wav:
+        if enable_flow_block_compile is None:
+            enable_flow_block_compile = (
+                code2wav_stage_factory().enable_flow_block_compile
+            )
+        else:
+            pass
         model = MiniCPMOCode2Wav(
             str(tmp_path),
             prompt_wav=str(default_reference_path),
@@ -178,7 +214,7 @@ def build_code2wav_model(
             reference_workers=reference_workers,
             prompt_cache_capacity=prompt_cache_capacity,
             decode_stream_priority=code2wav_stage_factory().decode_stream_priority,
-            enable_flow_block_compile=code2wav_stage_factory().enable_flow_block_compile,
+            enable_flow_block_compile=enable_flow_block_compile,
         )
         built_models.append(model)
         return model
@@ -261,6 +297,9 @@ def build_code2wav_stage(
         "unused",
         device=None,
         gpu_id=0,
+        max_batch_size=factory.max_batch_size,
+        max_batch_wait_ms=factory.max_batch_wait_ms,
+        batch_wait_when_idle=factory.batch_wait_when_idle,
         enable_flow_variable_length=factory.enable_flow_variable_length,
         reference_workers=factory.reference_workers,
         prompt_cache_capacity=factory.prompt_cache_capacity,
@@ -508,11 +547,11 @@ def test_vocode_prepares_and_decodes_on_its_private_stream(
     hift_streams: list[torch.Stream] = []
     reference_preparation_streams: list[torch.Stream] = []
 
-    def prepare_prompt(source: str | io.BytesIO) -> SpeakerPrompt:
+    def record_reference_preparation_stream(source: str | io.BytesIO) -> SpeakerPrompt:
         reference_preparation_streams.append(torch.cpu.current_stream())
         return fake_prepare_prompt(source)
 
-    def decode_flow(
+    def record_flow_stream(
         speech_tokens: torch.Tensor,
         speech_token_lengths: torch.Tensor,
         prompt_tokens: torch.Tensor,
@@ -532,13 +571,13 @@ def test_vocode_prepares_and_decodes_on_its_private_stream(
             n_timesteps,
         )
 
-    def decode_hift(speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def record_hift_stream(speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
         hift_streams.append(torch.cpu.current_stream())
         return fake_hift(speech_feat)
 
-    fake_token2wav.flow.inference.side_effect = decode_flow
-    fake_token2wav.hift.side_effect = decode_hift
-    fake_token2wav.prepare_prompt.side_effect = prepare_prompt
+    fake_token2wav.flow.inference.side_effect = record_flow_stream
+    fake_token2wav.hift.side_effect = record_hift_stream
+    fake_token2wav.prepare_prompt.side_effect = record_reference_preparation_stream
     references = [b"a", b"b"]
     # note (zhaochenyang20): CPU current-stream state is process-global, so one worker.
     model = build_code2wav_model(reference_workers=1)
@@ -551,6 +590,55 @@ def test_vocode_prepares_and_decodes_on_its_private_stream(
     assert all(stream == model.decode_stream for stream in hift_streams)
     assert model.decode_stream != caller_stream
     assert torch.cpu.current_stream() == caller_stream
+
+
+def test_code2wav_executor_uses_the_stage_batch_window(
+    build_code2wav_model: Code2WavBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = code2wav_stage_factory()
+    scheduler = build_code2wav_stage(build_code2wav_model(), monkeypatch)
+    assert scheduler.max_batch_size == factory.max_batch_size
+    assert scheduler.max_batch_wait_s == (
+        float(factory.max_batch_wait_ms) / MILLISECONDS_PER_SECOND
+    )
+    assert scheduler.batch_wait_when_idle is factory.batch_wait_when_idle
+
+
+def test_cuda_flow_blocks_compile_with_packed_precision(
+    build_code2wav_model: Code2WavBuilder,
+    fake_token2wav: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flow_blocks = [MagicMock(), MagicMock()]
+    fake_token2wav.device = torch.device("cuda")
+    fake_token2wav.flow.decoder.estimator.blocks = flow_blocks
+    monkeypatch.setattr(torch.cuda, "device", fake_token2wav.original_cuda_device)
+    compiled_options = capture_flow_compile(monkeypatch)
+    build_code2wav_model()
+    assert compiled_options == [PACKED_FLOW_COMPILE, PACKED_FLOW_COMPILE]
+
+
+@pytest.mark.parametrize(
+    ("device_type", "enable_flow_block_compile"),
+    [("cpu", True), ("cuda", False)],
+    ids=["cpu_vocoder", "compilation_disabled"],
+)
+def test_flow_blocks_stay_eager_without_cuda_compilation(
+    build_code2wav_model: Code2WavBuilder,
+    fake_token2wav: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: Literal["cpu", "cuda"],
+    enable_flow_block_compile: bool,
+) -> None:
+    fake_token2wav.device = torch.device(device_type)
+    fake_token2wav.flow.decoder.estimator.blocks = [MagicMock()]
+    if device_type == "cuda":
+        monkeypatch.setattr(torch.cuda, "device", fake_token2wav.original_cuda_device)
+    else:
+        pass
+    compiled_options = capture_flow_compile(monkeypatch)
+    build_code2wav_model(enable_flow_block_compile=enable_flow_block_compile)
+    assert compiled_options == []
 
 
 def test_vocode_mixed_lengths_preserve_hift_boundaries(
