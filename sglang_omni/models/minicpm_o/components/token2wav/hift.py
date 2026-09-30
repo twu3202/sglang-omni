@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +32,24 @@ from sglang_omni.models.minicpm_o.components.token2wav.hift_layers import (
     SourceModuleHnNSF2,
     init_weights,
 )
+
+
+@contextmanager
+def default_stream_for_cufft(
+    device: torch.device,
+) -> Iterator[torch.cuda.Stream | None]:
+    """Run cuFFT on the default stream and yield the caller's stream."""
+    if device.type == "cuda":
+        caller_stream = torch.cuda.current_stream(device)
+        default_stream = torch.cuda.default_stream(device)
+        # note (zhaochenyang20): new cuFFT plans upload their tables on the
+        # default stream, which a non-blocking caller stream does not wait for.
+        default_stream.wait_stream(caller_stream)
+        with torch.cuda.stream(default_stream):
+            yield caller_stream
+        caller_stream.wait_stream(default_stream)
+    else:
+        yield None
 
 
 class ConvRNNF0Predictor(nn.Module):
@@ -184,14 +205,19 @@ class HiFTGenerator(nn.Module):
         self.noise_generator: torch.Generator | None = None
 
     def stft(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        spec = torch.stft(
-            x,
-            self.istft_params["n_fft"],
-            self.istft_params["hop_len"],
-            self.istft_params["n_fft"],
-            window=self.stft_window.to(x.device),
-            return_complex=True,
-        )
+        with default_stream_for_cufft(x.device) as caller_stream:
+            spec = torch.stft(
+                x,
+                self.istft_params["n_fft"],
+                self.istft_params["hop_len"],
+                self.istft_params["n_fft"],
+                window=self.stft_window.to(x.device),
+                return_complex=True,
+            )
+        if caller_stream is not None:
+            spec.record_stream(caller_stream)
+        else:
+            pass
         spec = torch.view_as_real(spec)
         return (spec[..., 0], spec[..., 1])
 
@@ -199,13 +225,18 @@ class HiFTGenerator(nn.Module):
         magnitude = torch.clip(magnitude, max=100.0)
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
-        inverse_transform = torch.istft(
-            torch.complex(real, img),
-            self.istft_params["n_fft"],
-            self.istft_params["hop_len"],
-            self.istft_params["n_fft"],
-            window=self.stft_window.to(magnitude.device),
-        )
+        with default_stream_for_cufft(magnitude.device) as caller_stream:
+            inverse_transform = torch.istft(
+                torch.complex(real, img),
+                self.istft_params["n_fft"],
+                self.istft_params["hop_len"],
+                self.istft_params["n_fft"],
+                window=self.stft_window.to(magnitude.device),
+            )
+        if caller_stream is not None:
+            inverse_transform.record_stream(caller_stream)
+        else:
+            pass
         return inverse_transform
 
     def decode(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
