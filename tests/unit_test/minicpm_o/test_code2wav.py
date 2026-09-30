@@ -125,6 +125,31 @@ def fake_flow_inference(
     return frames.unsqueeze(1).expand(-1, FAKE_MEL_BINS, -1)
 
 
+class OfflineCudaStream:
+    """CUDA stream stand-in. The default unit-test job has no GPU."""
+
+    def __init__(
+        self, *, priority: int, device: torch.device | int | None = None
+    ) -> None:
+        self.priority = priority
+        self.device = device
+        self.earlier_stream: OfflineCudaStream | None = None
+
+    def wait_stream(self, earlier_stream: OfflineCudaStream) -> None:
+        self.earlier_stream = earlier_stream
+
+
+def current_offline_cuda_stream(
+    device: torch.device | int | None = None,
+) -> OfflineCudaStream:
+    return OfflineCudaStream(priority=0, device=device)
+
+
+def install_offline_cuda_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "Stream", OfflineCudaStream)
+    monkeypatch.setattr(torch.cuda, "current_stream", current_offline_cuda_stream)
+
+
 def capture_flow_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[dict[str, bool | dict[str, bool]]]:
@@ -181,7 +206,6 @@ def fake_token2wav(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MagicMock
     token2wav.hift.side_effect = fake_hift
     token2wav.prepare_prompt.side_effect = fake_prepare_prompt
     monkeypatch.setattr(code2wav, "Token2Wav", MagicMock(return_value=token2wav))
-    token2wav.original_cuda_device = torch.cuda.device
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     return token2wav
 
@@ -612,7 +636,7 @@ def test_cuda_flow_blocks_compile_with_packed_precision(
     flow_blocks = [MagicMock(), MagicMock()]
     fake_token2wav.device = torch.device("cuda")
     fake_token2wav.flow.decoder.estimator.blocks = flow_blocks
-    monkeypatch.setattr(torch.cuda, "device", fake_token2wav.original_cuda_device)
+    install_offline_cuda_streams(monkeypatch)
     compiled_options = capture_flow_compile(monkeypatch)
     build_code2wav_model()
     assert compiled_options == [PACKED_FLOW_COMPILE, PACKED_FLOW_COMPILE]
@@ -633,7 +657,7 @@ def test_flow_blocks_stay_eager_without_cuda_compilation(
     fake_token2wav.device = torch.device(device_type)
     fake_token2wav.flow.decoder.estimator.blocks = [MagicMock()]
     if device_type == "cuda":
-        monkeypatch.setattr(torch.cuda, "device", fake_token2wav.original_cuda_device)
+        install_offline_cuda_streams(monkeypatch)
     else:
         pass
     compiled_options = capture_flow_compile(monkeypatch)
