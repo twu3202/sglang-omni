@@ -243,7 +243,15 @@ def create_speech_scheduler(
 ) -> SessionScheduler:
     """Build speech; dtype and extra options follow the stage loader contract."""
     device = str(resolve_concrete_device(device, gpu_id))
-    codec = MiniCPMOCode2Wav(model_path, device=device, prompt_wav=reference_audio)
+    # Note (Junnan Li): Sessions stream one reference each, so the batched-offline options stay off.
+    codec = MiniCPMOCode2Wav(
+        model_path,
+        device=device,
+        prompt_wav=reference_audio,
+        enable_flow_variable_length=False,
+        reference_workers=1,
+        prompt_cache_capacity=max_open_sessions,
+    )
     runtime = MiniCPMOVocoderRuntime(codec.token2wav)
     return SessionScheduler(
         SpeechHooks(runtime, Path(codec.default_prompt_wav).read_bytes()),

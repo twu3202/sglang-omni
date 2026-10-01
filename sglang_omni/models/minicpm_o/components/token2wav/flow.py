@@ -308,7 +308,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             cache["estimator_att_cache"] if cache is not None else None
         )
         spk = F.normalize(spk, dim=1)
-        spk = self.spk_embed_affine_layer(spk)
+        spk = self.speaker_embedding_projection(spk)
         token = self.input_embedding(token)
         conformer_state = ConformerState.from_packed(
             conformer_cnn_cache,
